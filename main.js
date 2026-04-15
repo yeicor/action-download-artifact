@@ -342,17 +342,18 @@ async function main() {
                 }
             }
 
-            // Stream the ZIP straight to a temp file – zero in-memory buffering.
+            // For skip_unpack, stream directly to the final destination – no temp file needed.
+            if (skipUnpack) {
+                fs.mkdirSync(path, { recursive: true })
+                const destZipPath = `${pathname.join(path, artifact.name)}.zip`
+                await streamUrlToFile(downloadUrl, destZipPath)
+                continue
+            }
+
+            // Stream the ZIP to a temp file for extraction.
             const tempZipPath = pathname.join(os.tmpdir(), `artifact-${artifact.id}.zip`)
             try {
                 await streamUrlToFile(downloadUrl, tempZipPath)
-
-                if (skipUnpack) {
-                    fs.mkdirSync(path, { recursive: true })
-                    const destZipPath = `${pathname.join(path, artifact.name)}.zip`
-                    fs.copyFileSync(tempZipPath, destZipPath)
-                    continue
-                }
 
                 const dir = name && (!nameIsRegExp || mergeMultiple) ? path : pathname.join(path, artifact.name)
 
