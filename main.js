@@ -6,6 +6,9 @@ import AdmZip from 'adm-zip'
 import { filesize } from 'filesize'
 import pathname from 'node:path'
 import fs from 'node:fs'
+import https from 'node:https'
+import http from 'node:http'
+import os from 'node:os'
 
 async function downloadAction(name, path) {
     const artifactClient = artifact.create()
@@ -18,6 +21,69 @@ async function downloadAction(name, path) {
         downloadOptions
     )
     core.setOutput("found_artifact", true)
+}
+
+/**
+ * Resolves the final pre-signed download URL for an artifact by letting
+ * Octokit attempt the request with redirects disabled, then following the
+ * Location header ourselves so we never buffer the ZIP body in JS memory.
+ */
+async function getArtifactDownloadUrl(client, owner, repo, artifactId) {
+    try {
+        // Ask Octokit NOT to follow the redirect so we get the Location header.
+        await client.rest.actions.downloadArtifact({
+            owner,
+            repo,
+            artifact_id: artifactId,
+            archive_format: "zip",
+            request: { redirect: "manual" },
+        })
+    } catch (error) {
+        // Octokit throws on 302 when redirects are disabled; grab the URL.
+        if (error.status === 302 && error.response?.headers?.location) {
+            return error.response.headers.location
+        }
+        // Some Octokit versions expose it differently.
+        if (error.response?.headers?.location) {
+            return error.response.headers.location
+        }
+        throw error
+    }
+    throw new Error("Expected a redirect response from downloadArtifact but got none")
+}
+
+/**
+ * Streams a URL (following up to one redirect) straight to a file on disk.
+ * Never holds the full body in Node.js heap memory.
+ */
+function streamUrlToFile(url, destPath) {
+    return new Promise((resolve, reject) => {
+        const dest = fs.createWriteStream(destPath)
+
+        const handleResponse = (res) => {
+            // Follow a single redirect (the pre-signed Azure Blob URL may itself redirect).
+            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                res.resume() // drain the redirect body
+                const redirectUrl = new URL(res.headers.location)
+                const mod = redirectUrl.protocol === 'https:' ? https : http
+                mod.get(res.headers.location, handleResponse).on('error', reject)
+                return
+            }
+            if (res.statusCode !== 200) {
+                reject(new Error(`Unexpected HTTP ${res.statusCode} while downloading artifact from ${url}`))
+                res.resume()
+                return
+            }
+            res.on('error', reject)
+            res.pipe(dest)
+            dest.on('finish', resolve)
+            dest.on('error', reject)
+        }
+
+        const parsedUrl = new URL(url)
+        const mod = parsedUrl.protocol === 'https:' ? https : http
+        mod.get(url, handleResponse).on('error', reject)
+    })
 }
 
 async function getWorkflow(client, owner, repo, runID) {
@@ -264,14 +330,10 @@ async function main() {
 
             core.info(`==> Downloading: ${artifact.name}.zip (${size})`)
 
-            let zip
+            // Resolve the pre-signed download URL without buffering the body.
+            let downloadUrl
             try {
-                zip = await client.rest.actions.downloadArtifact({
-                    owner: owner,
-                    repo: repo,
-                    artifact_id: artifact.id,
-                    archive_format: "zip",
-                })
+                downloadUrl = await getArtifactDownloadUrl(client, owner, repo, artifact.id)
             } catch (error) {
                 if (error.message.startsWith("Artifact has expired")) {
                     return setExitMessage(ifNoArtifactFound, "no downloadable artifacts found (expired)")
@@ -280,33 +342,42 @@ async function main() {
                 }
             }
 
-            if (skipUnpack) {
-                fs.mkdirSync(path, { recursive: true })
-                fs.writeFileSync(`${pathname.join(path, artifact.name)}.zip`, Buffer.from(zip.data), 'binary')
-                continue
+            // Stream the ZIP straight to a temp file – zero in-memory buffering.
+            const tempZipPath = pathname.join(os.tmpdir(), `artifact-${artifact.id}.zip`)
+            try {
+                await streamUrlToFile(downloadUrl, tempZipPath)
+
+                if (skipUnpack) {
+                    fs.mkdirSync(path, { recursive: true })
+                    const destZipPath = `${pathname.join(path, artifact.name)}.zip`
+                    fs.copyFileSync(tempZipPath, destZipPath)
+                    continue
+                }
+
+                const dir = name && (!nameIsRegExp || mergeMultiple) ? path : pathname.join(path, artifact.name)
+
+                fs.mkdirSync(dir, { recursive: true })
+
+                core.startGroup(`==> Extracting: ${artifact.name}.zip`)
+                if (useUnzip) {
+                    // Temp file is already on disk – hand it straight to unzip.
+                    await exec.exec("unzip", ["-o", tempZipPath, "-d", dir])
+                } else {
+                    // AdmZip file-path constructor: reads entries one at a time, not all into RAM.
+                    const adm = new AdmZip(tempZipPath)
+                    adm.getEntries().forEach((entry) => {
+                        const action = entry.isDirectory ? "creating" : "inflating"
+                        const filepath = pathname.join(dir, entry.entryName)
+
+                        core.info(`  ${action}: ${filepath}`)
+                    })
+                    adm.extractAllTo(dir, true)
+                }
+                core.endGroup()
+            } finally {
+                // Always clean up the temp file, even if extraction failed.
+                try { fs.rmSync(tempZipPath) } catch (e) { core.debug(`Failed to remove temp file ${tempZipPath}: ${e.message}`) }
             }
-
-            const dir = name && (!nameIsRegExp || mergeMultiple) ? path : pathname.join(path, artifact.name)
-
-            fs.mkdirSync(dir, { recursive: true })
-
-            core.startGroup(`==> Extracting: ${artifact.name}.zip`)
-            if (useUnzip) {
-                const zipPath = `${pathname.join(dir, artifact.name)}.zip`
-                fs.writeFileSync(zipPath, Buffer.from(zip.data), 'binary')
-                await exec.exec("unzip", [zipPath, "-d", dir])
-                fs.rmSync(zipPath)
-            } else {
-                const adm = new AdmZip(Buffer.from(zip.data))
-                adm.getEntries().forEach((entry) => {
-                    const action = entry.isDirectory ? "creating" : "inflating"
-                    const filepath = pathname.join(dir, entry.entryName)
-
-                    core.info(`  ${action}: ${filepath}`)
-                })
-                adm.extractAllTo(dir, true)
-            }
-            core.endGroup()
         }
     } catch (error) {
         core.setOutput("found_artifact", false)
