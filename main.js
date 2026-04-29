@@ -27,6 +27,8 @@ async function downloadAction(name, path) {
  * Downloads an artifact ZIP directly to disk via Octokit, following redirects
  * without buffering the body in RAM. Non-2xx responses are returned as-is so
  * Octokit can parse and throw the appropriate error (e.g. "Artifact has expired").
+ *
+ * Requires Node.js 18+ for global fetch and Response support (enforce in action.yml).
  */
 async function downloadArtifactToFile(client, owner, repo, artifactId, destPath) {
     await client.request(
@@ -38,7 +40,7 @@ async function downloadArtifactToFile(client, owner, repo, artifactId, destPath)
             archive_format: "zip",
             request: {
                 fetch: async (url, options) => {
-                    const res = await fetch(url, options)
+                    const res = await fetch(url, { ...options, redirect: "follow" })
                     if (!res.ok) return res
                     await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(destPath))
                     return new Response(null, { status: 200, headers: res.headers })
@@ -313,17 +315,18 @@ async function main() {
             if (skipUnpack) continue
 
             // Stream the ZIP to a temp file for extraction.
+            core.startGroup(`==> Extracting: ${artifact.name}.zip`)
             try {
                 const dir = name && (!nameIsRegExp || mergeMultiple) ? path : pathname.join(path, artifact.name)
 
                 fs.mkdirSync(dir, { recursive: true })
 
-                core.startGroup(`==> Extracting: ${artifact.name}.zip`)
                 if (useUnzip) {
                     // Temp file is already on disk – hand it straight to unzip.
                     await exec.exec("unzip", ["-o", destPath, "-d", dir])
                 } else {
-                    // AdmZip file-path constructor: reads entries one at a time, not all into RAM.
+                    // AdmZip loads the entire ZIP into RAM.
+                    // For large artifacts set `use_unzip: true` for streaming extraction.
                     const adm = new AdmZip(destPath)
                     adm.getEntries().forEach((entry) => {
                         const action = entry.isDirectory ? "creating" : "inflating"
@@ -333,8 +336,8 @@ async function main() {
                     })
                     adm.extractAllTo(dir, true)
                 }
-                core.endGroup()
             } finally {
+                core.endGroup()
                 // Always clean up the temp file, even if extraction failed.
                 try { fs.rmSync(destPath) } catch (e) { core.debug(`Failed to remove temp file ${destPath}: ${e.message}`) }
             }
